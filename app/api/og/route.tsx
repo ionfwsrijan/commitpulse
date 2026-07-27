@@ -1,205 +1,253 @@
+// app/api/og/route.tsx
+
 import { ImageResponse } from 'next/og';
 import { NextRequest } from 'next/server';
+import { ogParamsSchema, coerceQueryParams } from '@/lib/validations';
+import { themes } from '@/lib/svg/themes';
+import { fetchGitHubContributions } from '@/lib/github';
+import { calculateStreak } from '@/lib/calculate';
+import { logger } from '@/lib/logger';
+import { getClientIp } from '@/utils/getClientIp';
+import { getRateLimitHeaders, RateLimiter } from '@/lib/rate-limit';
 
-// Must be Edge runtime — Vercel's OG image generation requires it,
-// and it's much faster than Node (no cold-start overhead).
-export const runtime = 'edge';
+const ogRateLimiter = new RateLimiter(30, 60_000, 1);
+const appUrl =
+  process.env.NEXT_PUBLIC_SITE_URL ||
+  (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://commitpulse.vercel.app');
 
-// X/Twitter crawlers have a ~5 s hard timeout.
-// We use the lightweight REST endpoint (no GraphQL, no rate-limit headers)
-// and fall back gracefully so the image always renders.
-async function fetchUserFast(username: string) {
-  const headers: HeadersInit = { Accept: 'application/vnd.github+json' };
-  const pat = process.env.GITHUB_PAT;
-  if (pat) headers.Authorization = `Bearer ${pat}`;
+const displayDomain = (() => {
+  try {
+    return new URL(appUrl).host;
+  } catch {
+    return 'commitpulse.vercel.app';
+  }
+})();
 
-  const res = await fetch(`https://api.github.com/users/${username}`, {
-    headers,
-    // next: { revalidate: 3600 }, // not supported on edge — use Cache-Control header instead
-  });
+function getLuminance(hex: string) {
+  let normalizedHex = hex.trim();
+  if (normalizedHex.length === 4 || normalizedHex.length === 5) {
+    normalizedHex = `#${normalizedHex[1]}${normalizedHex[1]}${normalizedHex[2]}${normalizedHex[2]}${normalizedHex[3]}${normalizedHex[3]}`;
+  }
+  const r = parseInt(normalizedHex.slice(1, 3), 16) / 255 || 0;
+  const g = parseInt(normalizedHex.slice(3, 5), 16) / 255 || 0;
+  const b = parseInt(normalizedHex.slice(5, 7), 16) / 255 || 0;
 
-  if (!res.ok) return null;
-  return res.json() as Promise<{
-    name: string | null;
-    login: string;
-    avatar_url: string;
-    bio: string | null;
-    public_repos: number;
-    followers: number;
-  }>;
+  const [R, G, B] = [r, g, b].map((c) =>
+    c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4)
+  );
+  return 0.2126 * R + 0.7152 * G + 0.0722 * B;
 }
 
-export async function GET(request: NextRequest) {
-  const { searchParams } = new URL(request.url);
-  const username = searchParams.get('username') ?? 'ghost';
+export async function GET(req: NextRequest) {
+  const ip = getClientIp(req);
+  const rateLimitKey =
+    ip && ip !== 'unknown' ? ip : `unknown:${req.headers.get('user-agent') ?? 'no-agent'}`;
 
-  // Fetch with a hard 4 s budget so we never exceed X's timeout
-  const user = await Promise.race([
-    fetchUserFast(username),
-    new Promise<null>((res) => setTimeout(() => res(null), 4000)),
-  ]);
+  const ogRateLimitResult = await ogRateLimiter.checkWithResult(rateLimitKey);
+  if (!ogRateLimitResult.success) {
+    return new Response(JSON.stringify({ error: 'Too many requests. Please try again later.' }), {
+      status: 429,
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
+        ...getRateLimitHeaders(ogRateLimitResult),
+      },
+    });
+  }
 
-  const name = user?.name || username;
-  const avatarUrl = user?.avatar_url ?? `https://github.com/${username}.png`;
-  const bio = (user?.bio ?? '').slice(0, 90);
-  const repos = user?.public_repos ?? 0;
-  const followers = user?.followers ?? 0;
+  const { searchParams } = new URL(req.url);
+
+  const parseResult = ogParamsSchema.safeParse(coerceQueryParams(searchParams));
+
+  if (!parseResult.success) {
+    return new Response(
+      JSON.stringify({ error: 'Invalid parameters', details: parseResult.error.flatten() }),
+      {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+      }
+    );
+  }
+
+  const {
+    user,
+    theme,
+    bg,
+    text,
+    accent,
+    refresh,
+    bypassCache: bypassCacheParam,
+  } = parseResult.data;
+  // Treat either ?refresh=true or ?bypassCache=true as a cache-bypass request
+  const isRefreshRequested = refresh || bypassCacheParam;
+
+  const themeName = theme || 'dark';
+  const isAutoTheme = themeName === 'auto';
+  const isRandomTheme = themeName === 'random';
+  const selectedTheme = (() => {
+    if (isAutoTheme) return themes.light;
+    if (isRandomTheme) {
+      const keys = Object.keys(themes);
+      const hash = user.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0);
+      const stableKey = keys[hash % keys.length];
+      return themes[stableKey] || themes.dark;
+    }
+    return themes[themeName] || themes.dark;
+  })();
+
+  const resolvedBg = `#${bg || selectedTheme.bg}`;
+  const resolvedText = `#${text || selectedTheme.text}`;
+  const resolvedAccent = `#${accent || selectedTheme.accent}`;
+
+  const luminance = getLuminance(resolvedBg);
+  const isLight = luminance > 0.5;
+  const cardBg = isLight ? 'rgba(0,0,0,0.08)' : 'rgba(255,255,255,0.08)';
+  const cardBorder = isLight ? 'rgba(0,0,0,0.08)' : 'rgba(255,255,255,0.1)';
+  const subText = isLight ? '#666666' : '#8b949e';
+
+  let totalCommits = 0;
+  let longestStreak = 0;
+  let currentStreak = 0;
+
+  try {
+    // bypassCache mirrors the ?refresh=true pattern used by /api/stats and /api/streak.
+    // Without this, every link-preview bot crawl fires a fresh GitHub GraphQL request,
+    // burning API quota on an endpoint that is embedded in every page's <meta> tag.
+    const data = await fetchGitHubContributions(user, { bypassCache: isRefreshRequested });
+    const stats = calculateStreak(data.calendar ?? data);
+    totalCommits = stats.totalContributions;
+    longestStreak = stats.longestStreak;
+    currentStreak = stats.currentStreak;
+  } catch (err) {
+    logger.error('Stats fetch failed', {
+      source: 'OG',
+      error: err,
+    });
+    // fallback to zeros if GitHub is unreachable
+  }
+
+  const cacheControl = isRefreshRequested
+    ? 'no-cache, no-store, must-revalidate'
+    : 'public, max-age=3600, stale-while-revalidate=86400';
 
   return new ImageResponse(
     <div
       style={{
         width: '1200px',
         height: '630px',
-        background: '#000000',
+        background: resolvedBg,
         display: 'flex',
         flexDirection: 'column',
         alignItems: 'center',
         justifyContent: 'center',
-        fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+        fontFamily: 'sans-serif',
         position: 'relative',
-        overflow: 'hidden',
       }}
     >
-      {/* Subtle top border glow */}
       <div
         style={{
           position: 'absolute',
-          top: 0,
-          left: 0,
-          right: 0,
-          height: '1px',
-          background: 'rgba(255,255,255,0.12)',
+          width: '600px',
+          height: '300px',
+          background: `radial-gradient(ellipse, ${resolvedAccent}33 0%, transparent 70%)`,
+          top: '50px',
+          left: '300px',
+          display: 'flex',
         }}
       />
-
-      {/* Faint radial glow behind card */}
-      <div
-        style={{
-          position: 'absolute',
-          top: '50%',
-          left: '50%',
-          transform: 'translate(-50%, -50%)',
-          width: '700px',
-          height: '700px',
-          borderRadius: '50%',
-          background: 'radial-gradient(circle, rgba(99,102,241,0.08) 0%, transparent 70%)',
-        }}
-      />
-
-      {/* Card */}
       <div
         style={{
           display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          gap: '28px',
-          padding: '56px 80px',
-          background: 'rgba(255,255,255,0.03)',
-          border: '1px solid rgba(255,255,255,0.09)',
-          borderRadius: '24px',
-          width: '920px',
+          fontSize: '48px',
+          color: resolvedAccent,
+          fontWeight: 'bold',
+          marginBottom: '24px',
         }}
       >
-        {/* Avatar + name */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '36px' }}>
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img
-            src={avatarUrl}
-            width={104}
-            height={104}
-            style={{ borderRadius: '50%', border: '1px solid rgba(255,255,255,0.15)' }}
-            alt={name}
-          />
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <span style={{ color: '#ffffff', fontSize: '40px', fontWeight: 700, lineHeight: 1 }}>
-              {name}
-            </span>
-            <span style={{ color: '#A1A1AA', fontSize: '20px', fontWeight: 400 }}>@{username}</span>
-            {bio && (
-              <span style={{ color: 'rgba(255,255,255,0.45)', fontSize: '15px', marginTop: '2px' }}>
-                {bio}
-              </span>
-            )}
-          </div>
-        </div>
-
-        {/* Divider */}
+        {'⚡ CommitPulse'}
+      </div>
+      <div style={{ display: 'flex', fontSize: '32px', color: resolvedText, marginBottom: '48px' }}>
+        {`@${user}`}
+      </div>
+      <div style={{ display: 'flex', gap: '48px' }}>
         <div
           style={{
-            width: '100%',
-            height: '1px',
-            background: 'rgba(255,255,255,0.08)',
-          }}
-        />
-
-        {/* Stats */}
-        <div style={{ display: 'flex', gap: '56px', alignItems: 'center' }}>
-          {[
-            { value: repos, label: 'Repositories' },
-            { value: followers, label: 'Followers' },
-          ].map((stat, i, arr) => (
-            <div key={stat.label} style={{ display: 'flex', alignItems: 'center', gap: '56px' }}>
-              <div
-                style={{
-                  display: 'flex',
-                  flexDirection: 'column',
-                  alignItems: 'center',
-                  gap: '6px',
-                }}
-              >
-                <span
-                  style={{ fontSize: '52px', fontWeight: 700, color: '#ffffff', lineHeight: 1 }}
-                >
-                  {stat.value.toLocaleString()}
-                </span>
-                <span
-                  style={{
-                    fontSize: '12px',
-                    color: '#A1A1AA',
-                    letterSpacing: '2px',
-                    textTransform: 'uppercase',
-                  }}
-                >
-                  {stat.label}
-                </span>
-              </div>
-              {i < arr.length - 1 && (
-                <div
-                  style={{ width: '1px', height: '56px', background: 'rgba(255,255,255,0.08)' }}
-                />
-              )}
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Branding */}
-      <div
-        style={{
-          position: 'absolute',
-          bottom: '28px',
-          display: 'flex',
-          alignItems: 'center',
-          gap: '8px',
-        }}
-      >
-        <span
-          style={{
-            fontSize: '13px',
-            color: 'rgba(255,255,255,0.25)',
-            letterSpacing: '3px',
-            textTransform: 'uppercase',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            background: cardBg,
+            border: `1px solid ${cardBorder}`,
+            borderRadius: '16px',
+            padding: '32px 48px',
           }}
         >
-          commitpulse.vercel.app
-        </span>
+          <div
+            style={{ display: 'flex', fontSize: '56px', fontWeight: 'bold', color: resolvedAccent }}
+          >
+            {String(totalCommits)}
+          </div>
+          <div style={{ display: 'flex', fontSize: '18px', color: subText, marginTop: '8px' }}>
+            Total Commits
+          </div>
+        </div>
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            background: cardBg,
+            border: `1px solid ${cardBorder}`,
+            borderRadius: '16px',
+            padding: '32px 48px',
+          }}
+        >
+          <div
+            style={{ display: 'flex', fontSize: '56px', fontWeight: 'bold', color: resolvedAccent }}
+          >
+            {String(longestStreak)}
+          </div>
+          <div style={{ display: 'flex', fontSize: '18px', color: subText, marginTop: '8px' }}>
+            {'Longest Streak 🔥'}
+          </div>
+        </div>
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            background: cardBg,
+            border: `1px solid ${cardBorder}`,
+            borderRadius: '16px',
+            padding: '32px 48px',
+          }}
+        >
+          <div
+            style={{ display: 'flex', fontSize: '56px', fontWeight: 'bold', color: resolvedAccent }}
+          >
+            {String(currentStreak)}
+          </div>
+          <div style={{ display: 'flex', fontSize: '18px', color: subText, marginTop: '8px' }}>
+            {'Current Streak ⚡'}
+          </div>
+        </div>
+      </div>
+      <div
+        style={{
+          display: 'flex',
+          position: 'absolute',
+          bottom: '32px',
+          fontSize: '16px',
+          color: subText,
+        }}
+      >
+        {displayDomain}
       </div>
     </div>,
     {
       width: 1200,
       height: 630,
       headers: {
-        'Cache-Control': 'public, max-age=3600, stale-while-revalidate=86400',
+        'Cache-Control': cacheControl,
       },
     }
   );
